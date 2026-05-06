@@ -269,18 +269,30 @@ async def scrape_company_page(context, url: str) -> dict:
             }
 
             // ── PHONE NUMBER ──
-            // Check popovers/tooltips first (revealed by button clicks)
-            const popoverEls = document.querySelectorAll(
-                '[role="tooltip"], [class*="popover"], [class*="Popover"], ' +
-                '[class*="dropdown-menu"], [class*="tooltip"], [aria-expanded="true"] + *'
+            // EuroPages uses Tippy.js popovers - check .tippy-content first
+            const tippyEls = document.querySelectorAll(
+                '.tippy-content, .tippy-box, [data-tippy-root], ' +
+                '[role="tooltip"], [class*="popover"], [class*="Popover"]'
             );
-            for (const el of popoverEls) {
+            for (const el of tippyEls) {
                 const text = el.innerText || el.textContent || '';
                 const match = text.match(/[+]?[\d\s()\-\.]{7,25}/);
                 if (match) {
                     const phone = match[0].trim();
                     if (phone.replace(/\D/g, '').length >= 7) {
                         result.phoneNumber = phone;
+                        break;
+                    }
+                }
+            }
+
+            // Also check span.font-copy-400 inside tippy (exact EuroPages structure)
+            if (!result.phoneNumber) {
+                const fontCopyEls = document.querySelectorAll('.tippy-content .font-copy-400, .tippy-content span');
+                for (const el of fontCopyEls) {
+                    const text = el.textContent.trim();
+                    if (text.match(/^[+]?[\d\s()\-\.]{7,25}$/) && text.replace(/\D/g, '').length >= 7) {
+                        result.phoneNumber = text;
                         break;
                     }
                 }
@@ -370,8 +382,21 @@ async def scrape_company_page(context, url: str) -> dict:
             }
 
             // ── ADDRESS ──
-            const addrEl = document.querySelector('[class*="address" i], address');
-            if (addrEl) result.address = addrEl.textContent.trim().replace(/\\s+/g, ' ');
+            // EuroPages puts address in font-copy-400 text-neutral-100 below company name
+            const addrEls = document.querySelectorAll('.font-copy-400.text-neutral-100');
+            for (const el of addrEls) {
+                const text = el.textContent.trim();
+                // Address usually contains commas, numbers, or street indicators
+                if (text && (text.includes(',') || /\d{4,5}/.test(text) || text.length > 10)) {
+                    result.address = text.replace(/\s+/g, ' ');
+                    break;
+                }
+            }
+            // Fallback to generic address selectors
+            if (!result.address) {
+                const addrEl = document.querySelector('[class*="address" i], address');
+                if (addrEl) result.address = addrEl.textContent.trim().replace(/\s+/g, ' ');
+            }
 
             // ── DESCRIPTION ──
             const descEl = document.querySelector('[class*="description" i]');

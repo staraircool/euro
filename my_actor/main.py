@@ -269,36 +269,64 @@ async def scrape_company_page(context, url: str) -> dict:
             }
 
             // ── PHONE NUMBER ──
+            // Check popovers/tooltips first (revealed by button clicks)
+            const popoverEls = document.querySelectorAll(
+                '[role="tooltip"], [class*="popover"], [class*="Popover"], ' +
+                '[class*="dropdown-menu"], [class*="tooltip"], [aria-expanded="true"] + *'
+            );
+            for (const el of popoverEls) {
+                const text = el.innerText || el.textContent || '';
+                const match = text.match(/[+]?[\d\s()\-\.]{7,25}/);
+                if (match) {
+                    const phone = match[0].trim();
+                    if (phone.replace(/\D/g, '').length >= 7) {
+                        result.phoneNumber = phone;
+                        break;
+                    }
+                }
+            }
+
             // Check tel: links (including ones revealed by clicking)
-            for (const a of document.querySelectorAll('a[href^="tel:"]')) {
-                const phone = a.href.replace('tel:', '').trim();
-                if (phone && phone.length >= 7) {
-                    result.phoneNumber = phone;
-                    break;
+            if (!result.phoneNumber) {
+                for (const a of document.querySelectorAll('a[href^="tel:"]')) {
+                    const phone = a.href.replace('tel:', '').trim();
+                    if (phone && phone.length >= 7) {
+                        result.phoneNumber = phone;
+                        break;
+                    }
                 }
             }
 
             // Look for phone text near "Phone" / "Tel" labels
             if (!result.phoneNumber) {
                 const allText = document.body.innerText;
-                const phoneMatch = allText.match(/(?:Phone|Tel|Telephone|Mobile|Fax)[:\\s]*([+\\d\\s()\\-\\.]{7,25})/i);
+                const phoneMatch = allText.match(/(?:Phone|Tel|Telephone|Mobile)[:\s]*([+\d\s()\-\.]{7,25})/i);
                 if (phoneMatch) {
                     result.phoneNumber = phoneMatch[1].trim();
                 }
             }
 
-            // Look for phone numbers in elements with phone-related classes
+            // Check phone-related class elements
             if (!result.phoneNumber) {
                 const phoneEls = document.querySelectorAll(
                     '[class*="phone" i], [class*="tel" i], [data-testid*="phone"]'
                 );
                 for (const el of phoneEls) {
                     const text = el.innerText.trim();
-                    const match = text.match(/[+]?[\\d\\s()\\-\\.]{7,25}/);
-                    if (match) {
+                    const match = text.match(/[+]?[\d\s()\-\.]{7,25}/);
+                    if (match && match[0].replace(/\D/g, '').length >= 7) {
                         result.phoneNumber = match[0].trim();
                         break;
                     }
+                }
+            }
+
+            // Scan entire visible page for phone number patterns (last resort)
+            if (!result.phoneNumber) {
+                const bodyText = document.body.innerText;
+                const intlPhoneMatch = bodyText.match(/\+\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{3,10}[\s\-\.]?\d{0,10}/);
+                if (intlPhoneMatch) {
+                    result.phoneNumber = intlPhoneMatch[0].trim();
                 }
             }
 
@@ -400,15 +428,33 @@ async def _dismiss_cookies(page) -> None:
 
 
 async def _click_reveal_buttons(page) -> None:
-    """Click all buttons that reveal hidden contact info (phone, email)."""
+    """Click EuroPages buttons that reveal hidden contact info (phone, email).
+
+    EuroPages has buttons like 'Phone Number', 'Show Number' in the Contacts
+    section. Clicking them opens popovers with the actual data.
+    """
+    # EuroPages-specific selectors - ordered by priority
     reveal_selectors = [
-        'button:has-text("Show")', 'button:has-text("show")',
-        'a:has-text("Show number")', 'a:has-text("Show Number")',
-        'button:has-text("number")', 'button:has-text("phone")',
-        '[data-testid*="show"]', '[class*="show-phone"]',
-        '[class*="reveal"]', 'button:has-text("See")',
-        'button:has-text("View")', 'a:has-text("View")',
+        # EuroPages phone reveal buttons
+        'button:has-text("Phone Number")',
+        'button:has-text("Phone number")',
+        'button:has-text("phone number")',
+        # EuroPages show number buttons (VAT, phone, etc.)
+        'button:has-text("Show Number")',
+        'button:has-text("Show number")',
+        'button:has-text("show number")',
+        # Subtle/outline buttons in contacts area
+        'button.btn--subtle:has-text("Phone")',
+        'button.btn--subtle:has-text("Number")',
+        # Generic fallbacks
+        'a:has-text("Show Number")',
+        'a:has-text("Show number")',
+        '[data-testid*="show"]',
+        '[class*="show-phone"]',
+        '[class*="reveal"]',
+        'button:has-text("See phone")',
     ]
+
     for sel in reveal_selectors:
         try:
             elements = page.locator(sel)
@@ -418,11 +464,33 @@ async def _click_reveal_buttons(page) -> None:
                     el = elements.nth(i)
                     if await el.is_visible(timeout=500):
                         await el.click(timeout=2000)
-                        await page.wait_for_timeout(800)
+                        # Wait for popover to appear
+                        await page.wait_for_timeout(1500)
+                        log.info(f'  Clicked reveal button: {sel}')
                 except Exception:
                     continue
         except Exception:
             continue
+
+    # Also try scrolling to the Contacts section first to ensure buttons are loaded
+    try:
+        contacts_heading = page.locator('text=Contacts').first
+        if await contacts_heading.is_visible(timeout=1000):
+            await contacts_heading.scroll_into_view_if_needed()
+            await page.wait_for_timeout(1000)
+
+            # Re-try clicking phone buttons after scrolling
+            for sel in ['button:has-text("Phone")', 'button:has-text("phone")']:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=500):
+                        await btn.click(timeout=2000)
+                        await page.wait_for_timeout(1500)
+                        log.info(f'  Clicked after scroll: {sel}')
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
 
 def _is_company_url(url: str) -> bool:

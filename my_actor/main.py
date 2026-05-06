@@ -137,7 +137,7 @@ async def run_scraper(actor_input: dict) -> list[dict]:
                 log.info(f'  → Visiting company website: {company["website"]}')
                 contacts = await scrape_company_website(context, company['website'])
                 company['email'] = contacts.get('email', '')
-                company['phoneNumber'] = contacts.get('phoneNumber', '')
+                company['phone'] = contacts.get('phone', '')
 
                 # Use website contacts as fallback for address
                 if not company.get('address') and contacts.get('address'):
@@ -148,7 +148,7 @@ async def run_scraper(actor_input: dict) -> list[dict]:
 
                 log.info(
                     f'  ✓ {company.get("companyName", "?")} | '
-                    f'Phone: {company.get("phoneNumber") or "—"} | '
+                    f'Phone: {company.get("phone") or "—"} | '
                     f'Email: {company.get("email") or "—"}'
                 )
 
@@ -324,7 +324,7 @@ async def scrape_europages_detail(context, url: str) -> dict:
 
 async def scrape_company_website(context, website_url: str) -> dict:
     """Visit a company's own website and extract phone & email from footer/contact page."""
-    contacts = {'email': '', 'phoneNumber': '', 'address': ''}
+    contacts = {'email': '', 'phone': '', 'address': ''}
     page = await context.new_page()
 
     try:
@@ -344,13 +344,13 @@ async def scrape_company_website(context, website_url: str) -> dict:
         page_contacts = await _extract_contacts_from_page(page)
         if page_contacts.get('email'):
             contacts['email'] = page_contacts['email']
-        if page_contacts.get('phoneNumber'):
-            contacts['phoneNumber'] = page_contacts['phoneNumber']
+        if page_contacts.get('phone'):
+            contacts['phone'] = page_contacts['phone']
         if page_contacts.get('address'):
             contacts['address'] = page_contacts['address']
 
         # If no email/phone found, try visiting /contact or /contacts page
-        if not contacts['email'] or not contacts['phoneNumber']:
+        if not contacts['email'] or not contacts['phone']:
             contact_page_url = await _find_contact_page_link(page)
             if contact_page_url:
                 log.info(f'    → Visiting contact page: {contact_page_url}')
@@ -362,8 +362,8 @@ async def scrape_company_website(context, website_url: str) -> dict:
                     contact_page_data = await _extract_contacts_from_page(page)
                     if not contacts['email'] and contact_page_data.get('email'):
                         contacts['email'] = contact_page_data['email']
-                    if not contacts['phoneNumber'] and contact_page_data.get('phoneNumber'):
-                        contacts['phoneNumber'] = contact_page_data['phoneNumber']
+                    if not contacts['phone'] and contact_page_data.get('phone'):
+                        contacts['phone'] = contact_page_data['phone']
                     if not contacts['address'] and contact_page_data.get('address'):
                         contacts['address'] = contact_page_data['address']
                 except Exception:
@@ -380,7 +380,7 @@ async def scrape_company_website(context, website_url: str) -> dict:
 async def _extract_contacts_from_page(page) -> dict:
     """Extract email, phone, and address from any web page."""
     return await page.evaluate('''() => {
-        const result = { email: '', phoneNumber: '', address: '' };
+        const result = { email: '', phone: '', address: '' };
 
         const excludeEmailDomains = [
             'europages', 'sentry.io', 'googleapis', 'google.com',
@@ -433,13 +433,13 @@ async def _extract_contacts_from_page(page) -> dict:
         for (const a of document.querySelectorAll('a[href^="tel:"]')) {
             const phone = a.href.replace('tel:', '').replace(/%20/g, ' ').trim();
             if (phone && phone.replace(/\\D/g, '').length >= 7) {
-                result.phoneNumber = phone;
+                result.phone = phone;
                 break;
             }
         }
 
         // Priority 2: phone text in footer/contact sections
-        if (!result.phoneNumber) {
+        if (!result.phone) {
             const contactEls = document.querySelectorAll(
                 'footer, [class*="footer" i], [id*="footer" i], [class*="contact" i], ' +
                 '[class*="phone" i], [class*="tel" i]'
@@ -451,7 +451,7 @@ async def _extract_contacts_from_page(page) -> dict:
                 if (phoneMatch) {
                     const phone = phoneMatch[1].trim();
                     if (phone.replace(/\\D/g, '').length >= 7) {
-                        result.phoneNumber = phone;
+                        result.phone = phone;
                         break;
                     }
                 }
@@ -459,13 +459,13 @@ async def _extract_contacts_from_page(page) -> dict:
         }
 
         // Priority 3: any tel: pattern or international phone in visible text
-        if (!result.phoneNumber) {
+        if (!result.phone) {
             const bodyText = document.body.innerText;
             const intlMatch = bodyText.match(/(?:^|\\s)(\\+\\d{1,3}[\\s\\-\\.]?\\(?\\d{1,4}\\)?[\\s\\-\\.]?\\d{2,10}[\\s\\-\\.]?\\d{0,10})(?:\\s|$)/m);
             if (intlMatch) {
                 const phone = intlMatch[1].trim();
                 if (phone.replace(/\\D/g, '').length >= 7) {
-                    result.phoneNumber = phone;
+                    result.phone = phone;
                 }
             }
         }
@@ -543,7 +543,7 @@ def _clean_data(data: dict) -> dict:
             value = re.sub(r'\s+', ' ', value).strip()
             if key == 'companyName':
                 value = re.sub(r'\s*Verified\s*', '', value).strip()
-            if key == 'phoneNumber':
+            if key == 'phone':
                 value = re.sub(r'(?i)show\s*(phone|number|tel)', '', value).strip()
             if key == 'email':
                 if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', value):

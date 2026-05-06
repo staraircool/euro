@@ -1,0 +1,11 @@
+{
+    "actorOutputSchemaVersion": 1,
+    "title": "EuroPages Company Scraper Output",
+    "properties": {
+        "dataset": {
+            "type": "string",
+            "title": "Companies Dataset",
+            "template": "{{links.apiDefaultDatasetUrl}}/items"
+        }
+    }
+}

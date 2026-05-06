@@ -1,0 +1,45 @@
+{
+    "title": "EuroPages Company Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "searchQuery": {
+            "title": "Search Query",
+            "type": "string",
+            "description": "The keyword to search for on EuroPages (e.g. 'construction', 'doors', 'furniture')",
+            "editor": "textfield",
+            "default": "construction",
+            "prefill": "construction"
+        },
+        "startUrls": {
+            "title": "Start URLs",
+            "type": "array",
+            "description": "Direct EuroPages listing or company detail URLs to scrape. If provided, searchQuery is ignored.",
+            "editor": "requestListSources",
+            "default": [],
+            "prefill": []
+        },
+        "maxResults": {
+            "title": "Max Results",
+            "type": "integer",
+            "description": "Maximum number of companies to scrape (0 = unlimited)",
+            "default": 100,
+            "minimum": 0
+        },
+        "maxPages": {
+            "title": "Max Listing Pages",
+            "type": "integer",
+            "description": "Maximum number of search result pages to crawl for company links",
+            "default": 5,
+            "minimum": 1
+        },
+        "proxyConfiguration": {
+            "title": "Proxy Configuration",
+            "type": "object",
+            "description": "Proxy settings. Recommended for large-scale scraping to avoid blocks.",
+            "editor": "proxy",
+            "default": { "useApifyProxy": false }
+        }
+    },
+    "required": []
+}

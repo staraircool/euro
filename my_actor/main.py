@@ -1,4 +1,4 @@
-"""EuroPages Company Scraper - Main entry point.
+"""EuroPages Company Scraper - Lightweight version.
 
 Scrapes company data from europages.co.uk including:
 - Company name
@@ -7,624 +7,285 @@ Scrapes company data from europages.co.uk including:
 - Phone number
 - Country, address, description, and company type
 
-Uses Playwright for rendering JavaScript-heavy pages and handling
-dynamic content like "Show phone number" buttons.
+Uses httpx + BeautifulSoup for reliable scraping without heavy framework dependencies.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
+import os
 import re
 from urllib.parse import quote_plus, urljoin
 
-from apify import Actor
-from crawlee.playwright_crawler import PlaywrightCrawler, PlaywrightCrawlingContext
-from crawlee.configuration import Configuration
+import httpx
+from bs4 import BeautifulSoup
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+log = logging.getLogger('europages-scraper')
 
 # Base URL for EuroPages
 BASE_URL = 'https://www.europages.co.uk'
 
-# Labels for routing requests
-LABEL_LISTING = 'LISTING'
-LABEL_DETAIL = 'DETAIL'
+# Common headers to mimic a browser
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+}
 
 
 async def main() -> None:
     """Main entry point for the Apify Actor."""
-    async with Actor:
-        actor_input = await Actor.get_input() or {}
+    # Try to use Apify SDK if available, otherwise fall back to env vars
+    try:
+        from apify import Actor
+        async with Actor:
+            actor_input = await Actor.get_input() or {}
+            results = await run_scraper(actor_input)
+            for item in results:
+                await Actor.push_data(item)
+            Actor.log.info(f'Scraping complete! Found {len(results)} companies.')
+    except ImportError:
+        log.info('Apify SDK not available, running standalone...')
+        # Read input from environment or default
+        input_json = os.environ.get('ACTOR_INPUT', '{}')
+        actor_input = json.loads(input_json) if input_json else {}
+        results = await run_scraper(actor_input)
+        # Save results to dataset
+        dataset_dir = os.path.join('storage', 'datasets', 'default')
+        os.makedirs(dataset_dir, exist_ok=True)
+        for i, item in enumerate(results):
+            with open(os.path.join(dataset_dir, f'{i:06d}.json'), 'w') as f:
+                json.dump(item, f, indent=2)
+        log.info(f'Scraping complete! Found {len(results)} companies.')
+    except Exception as e:
+        log.error(f'Actor failed: {e}')
+        raise
 
-        search_query = actor_input.get('searchQuery', 'construction')
-        start_urls = actor_input.get('startUrls', [])
-        max_results = actor_input.get('maxResults', 100)
-        max_pages = actor_input.get('maxPages', 5)
-        proxy_config = actor_input.get('proxyConfiguration', {})
 
-        # Track how many results we've scraped
-        results_count = 0
+async def run_scraper(actor_input: dict) -> list[dict]:
+    """Run the EuroPages scraper with the given input."""
+    search_query = actor_input.get('searchQuery', 'construction')
+    start_urls = actor_input.get('startUrls', [])
+    max_results = actor_input.get('maxResults', 100)
+    max_pages = actor_input.get('maxPages', 5)
 
-        # Configure Crawlee
-        config = Configuration(
-            persist_storage=True,
-        )
+    results = []
 
-        # Build proxy configuration for Crawlee
-        proxy_url = None
-        if proxy_config and proxy_config.get('useApifyProxy'):
-            proxy_url = None  # Crawlee handles Apify proxy automatically
-
-        crawler = PlaywrightCrawler(
-            headless=True,
-            browser_type='chromium',
-            max_request_retries=3,
-            request_handler_timeout=120_000,  # 2 minutes per page
-            max_requests_per_crawl=max_results + (max_pages * 2) + 50 if max_results > 0 else 0,
-            configuration=config,
-        )
-
-        @crawler.router.default_handler
-        async def default_handler(context: PlaywrightCrawlingContext) -> None:
-            """Route requests based on their label."""
-            label = context.request.label or ''
-            url = context.request.url
-
-            if label == LABEL_DETAIL:
-                await handle_detail_page(context)
-            elif label == LABEL_LISTING:
-                await handle_listing_page(context, max_pages)
-            else:
-                # Auto-detect: if URL looks like a company page, treat as detail
-                if _is_company_url(url):
-                    await handle_detail_page(context)
-                else:
-                    await handle_listing_page(context, max_pages)
-
-        async def handle_listing_page(
-            context: PlaywrightCrawlingContext,
-            max_listing_pages: int,
-        ) -> None:
-            """Extract company links from a search results / listing page."""
-            nonlocal results_count
-
-            Actor.log.info(f'Processing listing page: {context.request.url}')
-
-            page = context.page
-
-            # Wait for the page to be fully loaded
-            try:
-                await page.wait_for_load_state('networkidle', timeout=30000)
-            except Exception:
-                await page.wait_for_load_state('domcontentloaded', timeout=15000)
-
-            # Accept cookies if the banner appears
-            await _dismiss_cookie_banner(page)
-
-            # Wait a bit for dynamic content
-            await page.wait_for_timeout(2000)
-
-            # Find company links on the listing page
-            # EuroPages company detail URLs follow pattern: /COMPANY-NAME/SEACXXXXX-XXX.html
-            company_links = await page.evaluate('''() => {
-                const links = [];
-                const allLinks = document.querySelectorAll('a[href]');
-                for (const link of allLinks) {
-                    const href = link.getAttribute('href');
-                    if (href && /\\/[A-Z0-9][^/]*\\/SEAC[0-9]+-[0-9]+\\.html/.test(href)) {
-                        const fullUrl = href.startsWith('http')
-                            ? href
-                            : window.location.origin + href;
-                        if (!links.includes(fullUrl)) {
-                            links.push(fullUrl);
-                        }
-                    }
-                }
-                return links;
-            }''')
-
-            Actor.log.info(f'Found {len(company_links)} company links on listing page')
-
-            # Enqueue company detail pages
-            for link in company_links:
-                if max_results > 0 and results_count >= max_results:
-                    Actor.log.info(f'Reached max results limit ({max_results})')
-                    break
-                results_count += 1
-                await context.add_requests([{
-                    'url': link,
-                    'label': LABEL_DETAIL,
-                }])
-
-            # Handle pagination - find "Next" page link
-            current_url = context.request.url
-            current_page_num = _extract_page_number(current_url)
-
-            if current_page_num < max_listing_pages:
-                next_page_url = await page.evaluate('''() => {
-                    // Look for next page links
-                    const nextBtns = document.querySelectorAll(
-                        'a[rel="next"], a.pagination-next, a[aria-label="Next"], ' +
-                        'button[aria-label="Next"], a[data-testid*="next"]'
-                    );
-                    for (const btn of nextBtns) {
-                        if (btn.href) return btn.href;
-                    }
-
-                    // Look for numbered pagination links
-                    const paginationLinks = document.querySelectorAll(
-                        'nav a[href], .pagination a[href], [class*="pagination"] a[href]'
-                    );
-                    const currentPage = ''' + str(current_page_num) + ''';
-                    for (const link of paginationLinks) {
-                        const text = link.textContent.trim();
-                        if (text === String(currentPage + 1)) {
-                            return link.href;
-                        }
-                    }
-
-                    return null;
-                }''')
-
-                if next_page_url:
-                    Actor.log.info(f'Found next page: {next_page_url}')
-                    await context.add_requests([{
-                        'url': next_page_url,
-                        'label': LABEL_LISTING,
-                    }])
-                else:
-                    # Try constructing the next page URL
-                    next_url = _build_next_page_url(current_url, current_page_num + 1)
-                    if next_url:
-                        Actor.log.info(f'Constructed next page URL: {next_url}')
-                        await context.add_requests([{
-                            'url': next_url,
-                            'label': LABEL_LISTING,
-                        }])
-
-        async def handle_detail_page(context: PlaywrightCrawlingContext) -> None:
-            """Extract company details from a company profile page."""
-            Actor.log.info(f'Processing company page: {context.request.url}')
-
-            page = context.page
-
-            # Wait for the page to load
-            try:
-                await page.wait_for_load_state('networkidle', timeout=30000)
-            except Exception:
-                await page.wait_for_load_state('domcontentloaded', timeout=15000)
-
-            # Accept cookies if needed
-            await _dismiss_cookie_banner(page)
-
-            # Wait for dynamic content
-            await page.wait_for_timeout(2000)
-
-            # Try to reveal hidden contact info (phone numbers, etc.)
-            await _reveal_contact_info(page)
-
-            # Extract all company data from the page
-            company_data = await page.evaluate('''() => {
-                const data = {
-                    companyName: '',
-                    email: '',
-                    website: '',
-                    phoneNumber: '',
-                    country: '',
-                    address: '',
-                    description: '',
-                    companyType: '',
-                };
-
-                // --- COMPANY NAME ---
-                // Try multiple selectors for the company name
-                const nameSelectors = [
-                    'h1',
-                    '[data-testid="company-name"]',
-                    '.company-name',
-                    '.company-header h1',
-                    '.header-company-name',
-                ];
-                for (const sel of nameSelectors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        // Get just the text, excluding child badges like "Verified"
-                        let name = '';
-                        for (const child of el.childNodes) {
-                            if (child.nodeType === Node.TEXT_NODE) {
-                                name += child.textContent.trim();
-                            }
-                        }
-                        if (!name) name = el.textContent.trim();
-                        // Clean up - remove "Verified" badge text
-                        name = name.replace(/\\s*Verified\\s*/g, '').trim();
-                        if (name) {
-                            data.companyName = name;
-                            break;
-                        }
-                    }
-                }
-
-                // --- EMAIL ---
-                // Look for mailto: links
-                const mailtoLinks = document.querySelectorAll('a[href^="mailto:"]');
-                for (const link of mailtoLinks) {
-                    const email = link.getAttribute('href').replace('mailto:', '').split('?')[0].trim();
-                    if (email && email.includes('@')) {
-                        data.email = email;
-                        break;
-                    }
-                }
-
-                // If no mailto, look for email text patterns in contact sections
-                if (!data.email) {
-                    const contactSections = document.querySelectorAll(
-                        '[class*="contact"], [class*="info"], [data-testid*="contact"]'
-                    );
-                    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/;
-                    for (const section of contactSections) {
-                        const match = section.textContent.match(emailRegex);
-                        if (match) {
-                            data.email = match[0];
-                            break;
-                        }
-                    }
-                }
-
-                // Also check entire page for email if still not found
-                if (!data.email) {
-                    const bodyText = document.body.innerText;
-                    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/;
-                    const match = bodyText.match(emailRegex);
-                    if (match) {
-                        // Filter out common false positives
-                        const email = match[0];
-                        if (!email.includes('europages') && !email.includes('example.com')) {
-                            data.email = email;
-                        }
-                    }
-                }
-
-                // --- WEBSITE ---
-                // Look for external website links
-                const websiteSelectors = [
-                    'a[data-testid*="website"]',
-                    'a[class*="website"]',
-                    'a[rel="nofollow noopener"][target="_blank"]',
-                ];
-                for (const sel of websiteSelectors) {
-                    const els = document.querySelectorAll(sel);
-                    for (const el of els) {
-                        const href = el.getAttribute('href');
-                        if (href && !href.includes('europages') &&
-                            !href.includes('google') && !href.includes('facebook') &&
-                            !href.includes('linkedin') && !href.includes('twitter') &&
-                            !href.includes('instagram') && !href.includes('youtube') &&
-                            (href.startsWith('http://') || href.startsWith('https://'))) {
-                            data.website = href;
-                            break;
-                        }
-                    }
-                    if (data.website) break;
-                }
-
-                // Fallback: look for links with globe/website icons or text "Website"
-                if (!data.website) {
-                    const allLinks = document.querySelectorAll('a[href]');
-                    for (const link of allLinks) {
-                        const text = link.textContent.trim().toLowerCase();
-                        const href = link.getAttribute('href');
-                        if ((text.includes('visit website') || text.includes('website') ||
-                             text.includes('web site') || text === 'www') &&
-                            href && !href.includes('europages') &&
-                            (href.startsWith('http://') || href.startsWith('https://'))) {
-                            data.website = href;
-                            break;
-                        }
-                    }
-                }
-
-                // --- PHONE NUMBER ---
-                // Look for tel: links
-                const telLinks = document.querySelectorAll('a[href^="tel:"]');
-                for (const link of telLinks) {
-                    const phone = link.getAttribute('href').replace('tel:', '').trim();
-                    if (phone) {
-                        data.phoneNumber = phone;
-                        break;
-                    }
-                }
-
-                // Look for phone number in visible text near phone-related elements
-                if (!data.phoneNumber) {
-                    const phoneContainers = document.querySelectorAll(
-                        '[class*="phone"], [class*="tel"], [data-testid*="phone"]'
-                    );
-                    const phoneRegex = /[+]?[\\d\\s().-]{7,20}/;
-                    for (const container of phoneContainers) {
-                        const match = container.textContent.match(phoneRegex);
-                        if (match) {
-                            data.phoneNumber = match[0].trim();
-                            break;
-                        }
-                    }
-                }
-
-                // --- COUNTRY ---
-                // Look for country flags or country text
-                const countrySelectors = [
-                    '[class*="country"]',
-                    '[data-testid*="country"]',
-                ];
-                for (const sel of countrySelectors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        data.country = el.textContent.trim();
-                        break;
-                    }
-                }
-
-                // Fallback: look for flag images with alt text
-                if (!data.country) {
-                    const flags = document.querySelectorAll('img[alt]');
-                    const countries = [
-                        'Germany', 'France', 'Italy', 'Spain', 'Poland', 'Netherlands',
-                        'Belgium', 'Austria', 'Switzerland', 'United Kingdom', 'Portugal',
-                        'Czech Republic', 'Romania', 'Sweden', 'Denmark', 'Finland',
-                        'Norway', 'Ireland', 'Hungary', 'Greece', 'Turkey',
-                    ];
-                    for (const flag of flags) {
-                        const alt = flag.getAttribute('alt');
-                        if (alt && countries.some(c => alt.includes(c))) {
-                            data.country = alt.trim();
-                            break;
-                        }
-                    }
-                }
-
-                // --- ADDRESS ---
-                // Look for address-related elements
-                const addressSelectors = [
-                    '[class*="address"]',
-                    '[data-testid*="address"]',
-                    'address',
-                ];
-                for (const sel of addressSelectors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        data.address = el.textContent.trim().replace(/\\s+/g, ' ');
-                        break;
-                    }
-                }
-
-                // Fallback: look for location info near the company header
-                if (!data.address) {
-                    const headerArea = document.querySelector(
-                        '[class*="header"], [class*="company-info"], [class*="CompanyHeader"]'
-                    );
-                    if (headerArea) {
-                        // Find text that looks like an address (contains postal code pattern)
-                        const postalRegex = /[A-Z]{0,2}[\\s-]?\\d{4,5}[\\s,]/;
-                        const text = headerArea.textContent;
-                        const match = text.match(postalRegex);
-                        if (match) {
-                            // Get the surrounding context
-                            const idx = text.indexOf(match[0]);
-                            const start = Math.max(0, text.lastIndexOf('\\n', idx));
-                            const end = text.indexOf('\\n', idx + match[0].length);
-                            data.address = text.substring(start, end > 0 ? end : undefined)
-                                .trim().replace(/\\s+/g, ' ');
-                        }
-                    }
-                }
-
-                // --- DESCRIPTION ---
-                const descSelectors = [
-                    '[class*="description"]',
-                    '[data-testid*="description"]',
-                    'meta[name="description"]',
-                ];
-                for (const sel of descSelectors) {
-                    const el = document.querySelector(sel);
-                    if (el) {
-                        if (el.tagName === 'META') {
-                            data.description = el.getAttribute('content') || '';
-                        } else {
-                            data.description = el.textContent.trim().substring(0, 500);
-                        }
-                        if (data.description) break;
-                    }
-                }
-
-                // --- COMPANY TYPE ---
-                // EuroPages shows types like "Manufacturer", "Distributor", "Service provider"
-                const typeKeywords = [
-                    'Manufacturer', 'Distributor', 'Service provider',
-                    'Wholesaler', 'Retailer', 'Subcontractor', 'Agent',
-                ];
-                const pageText = document.body.innerText;
-                for (const keyword of typeKeywords) {
-                    if (pageText.includes(keyword)) {
-                        data.companyType = keyword;
-                        break;
-                    }
-                }
-
-                return data;
-            }''')
-
-            # Also try to extract additional info using Playwright-specific methods
-            # Try clicking "Show Number" buttons to reveal phone numbers
-            if not company_data.get('phoneNumber'):
-                phone = await _try_extract_phone_from_page(page)
-                if phone:
-                    company_data['phoneNumber'] = phone
-
-            # Try extracting website from the Company Information sidebar
-            if not company_data.get('website'):
-                website = await _try_extract_website_from_sidebar(page)
-                if website:
-                    company_data['website'] = website
-
-            # Try extracting country from the header area text
-            if not company_data.get('country'):
-                country = await _try_extract_country(page)
-                if country:
-                    company_data['country'] = country
-
-            # Try extracting address from the header area
-            if not company_data.get('address'):
-                address = await _try_extract_address(page)
-                if address:
-                    company_data['address'] = address
-
-            # Add the source URL
-            company_data['europagesUrl'] = context.request.url
-
-            # Clean up the data
-            company_data = _clean_company_data(company_data)
-
-            # Only push if we have at least a company name
-            if company_data.get('companyName'):
-                Actor.log.info(
-                    f'Scraped: {company_data["companyName"]} | '
-                    f'Phone: {company_data.get("phoneNumber", "N/A")} | '
-                    f'Email: {company_data.get("email", "N/A")} | '
-                    f'Website: {company_data.get("website", "N/A")}'
-                )
-                await Actor.push_data(company_data)
-            else:
-                Actor.log.warning(f'No company name found on {context.request.url}')
-
-        # Build the initial request list
-        requests = []
-
+    async with httpx.AsyncClient(
+        headers=HEADERS,
+        follow_redirects=True,
+        timeout=30.0,
+    ) as client:
         if start_urls:
             # Use user-provided URLs
+            urls_to_process = []
             for url_item in start_urls:
                 url = url_item.get('url', url_item) if isinstance(url_item, dict) else str(url_item)
-                if _is_company_url(url):
-                    requests.append({'url': url, 'label': LABEL_DETAIL})
-                else:
-                    requests.append({'url': url, 'label': LABEL_LISTING})
+                urls_to_process.append(url)
         else:
             # Build search URL from query
-            search_url = f'{BASE_URL}/companies/{quote_plus(search_query)}.html'
-            Actor.log.info(f'Starting search with URL: {search_url}')
-            requests.append({'url': search_url, 'label': LABEL_LISTING})
+            urls_to_process = [f'{BASE_URL}/companies/{quote_plus(search_query)}.html']
 
-        # Run the crawler
-        Actor.log.info(f'Starting crawl with {len(requests)} initial URLs')
-        await crawler.run(requests)
-        Actor.log.info('Crawl finished!')
+        # Collect company detail URLs from listing pages
+        company_urls = []
+        for listing_url in urls_to_process:
+            if _is_company_url(listing_url):
+                company_urls.append(listing_url)
+            else:
+                found = await scrape_listing_pages(client, listing_url, max_pages, max_results)
+                company_urls.extend(found)
+                if len(company_urls) >= max_results > 0:
+                    company_urls = company_urls[:max_results]
+                    break
 
+        log.info(f'Found {len(company_urls)} company URLs to scrape')
 
-# ─── Helper Functions ─────────────────────────────────────────────────────────
+        # Scrape each company detail page
+        for i, url in enumerate(company_urls):
+            if max_results > 0 and len(results) >= max_results:
+                break
 
-async def _dismiss_cookie_banner(page) -> None:
-    """Try to dismiss the cookie consent banner if present."""
-    try:
-        cookie_selectors = [
-            'button[id*="cookie" i][id*="accept" i]',
-            'button[class*="cookie" i][class*="accept" i]',
-            'button:has-text("Accept")',
-            'button:has-text("Accept all")',
-            'button:has-text("Accept All")',
-            'button:has-text("I agree")',
-            'button:has-text("OK")',
-            '#onetrust-accept-btn-handler',
-            '[data-testid*="cookie"] button',
-            '.cookie-banner button',
-        ]
-        for selector in cookie_selectors:
             try:
-                btn = page.locator(selector).first
-                if await btn.is_visible(timeout=1000):
-                    await btn.click(timeout=2000)
-                    await page.wait_for_timeout(500)
-                    return
-            except Exception:
-                continue
-    except Exception:
-        pass
+                log.info(f'[{i+1}/{len(company_urls)}] Scraping: {url}')
+                company_data = await scrape_company_page(client, url)
+                if company_data and company_data.get('companyName'):
+                    results.append(company_data)
+                    log.info(
+                        f'  -> {company_data["companyName"]} | '
+                        f'Phone: {company_data.get("phoneNumber", "N/A")} | '
+                        f'Email: {company_data.get("email", "N/A")}'
+                    )
+                else:
+                    log.warning(f'  -> No data extracted from {url}')
+            except Exception as e:
+                log.error(f'  -> Error scraping {url}: {e}')
+
+            # Small delay between requests
+            await asyncio.sleep(1)
+
+    return results
 
 
-async def _reveal_contact_info(page) -> None:
-    """Try to click buttons that reveal hidden contact information."""
-    reveal_selectors = [
-        'button:has-text("Show Number")',
-        'button:has-text("Show number")',
-        'button:has-text("Show phone")',
-        'button:has-text("Show Phone")',
-        'a:has-text("Show Number")',
-        'a:has-text("Show number")',
-        '[data-testid*="show-phone"]',
-        '[class*="show-phone"]',
-        '[class*="reveal"]',
-    ]
-    for selector in reveal_selectors:
+async def scrape_listing_pages(
+    client: httpx.AsyncClient,
+    base_url: str,
+    max_pages: int,
+    max_results: int,
+) -> list[str]:
+    """Scrape listing/search pages to find company URLs."""
+    company_urls = []
+
+    for page_num in range(1, max_pages + 1):
+        if max_results > 0 and len(company_urls) >= max_results:
+            break
+
+        # Build the page URL
+        if page_num == 1:
+            url = base_url
+        elif '?' in base_url:
+            url = f'{base_url}&page={page_num}'
+        else:
+            url = f'{base_url}?page={page_num}'
+
+        log.info(f'Fetching listing page {page_num}: {url}')
+
         try:
-            elements = page.locator(selector)
-            count = await elements.count()
-            for i in range(min(count, 3)):
-                try:
-                    el = elements.nth(i)
-                    if await el.is_visible(timeout=1000):
-                        await el.click(timeout=2000)
-                        await page.wait_for_timeout(1000)
-                except Exception:
-                    continue
-        except Exception:
-            continue
+            response = await client.get(url)
+            response.raise_for_status()
+        except Exception as e:
+            log.error(f'Failed to fetch listing page {page_num}: {e}')
+            break
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Find company links - EuroPages pattern: /COMPANY-NAME/SEACxxxxxx-xxx.html
+        links_found = 0
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag['href']
+            if re.search(r'/[A-Za-z0-9][^/]*/SEAC\d+-\d+\.html', href):
+                full_url = href if href.startswith('http') else urljoin(BASE_URL, href)
+                if full_url not in company_urls:
+                    company_urls.append(full_url)
+                    links_found += 1
+
+        log.info(f'  Found {links_found} company links on page {page_num}')
+
+        if links_found == 0:
+            log.info('  No more company links found, stopping pagination')
+            break
+
+        # Small delay between pages
+        await asyncio.sleep(1)
+
+    return company_urls
 
 
-async def _try_extract_phone_from_page(page) -> str | None:
-    """Try multiple strategies to extract phone number."""
+async def scrape_company_page(client: httpx.AsyncClient, url: str) -> dict:
+    """Scrape a single company detail page."""
     try:
-        # Check for tel: links after reveal
-        tel_link = page.locator('a[href^="tel:"]').first
-        if await tel_link.count() > 0:
-            href = await tel_link.get_attribute('href')
-            if href:
-                return href.replace('tel:', '').strip()
+        response = await client.get(url)
+        response.raise_for_status()
+    except Exception as e:
+        log.error(f'Failed to fetch company page: {e}')
+        return {}
 
-        # Check for phone patterns in Company Information section
-        info_section = page.locator('text=Company Information').first
-        if await info_section.count() > 0:
-            parent = info_section.locator('..')
-            text = await parent.inner_text()
-            phone_match = re.search(r'(?:Phone|Tel|Telephone)[:\s]*([+\d\s().-]{7,20})', text, re.IGNORECASE)
-            if phone_match:
-                return phone_match.group(1).strip()
+    html = response.text
+    soup = BeautifulSoup(html, 'html.parser')
 
-        return None
-    except Exception:
-        return None
+    data = {
+        'companyName': '',
+        'email': '',
+        'website': '',
+        'phoneNumber': '',
+        'country': '',
+        'address': '',
+        'description': '',
+        'companyType': '',
+        'europagesUrl': url,
+    }
 
+    # --- COMPANY NAME ---
+    h1 = soup.find('h1')
+    if h1:
+        # Get text, removing badge elements
+        for badge in h1.find_all(['span', 'div'], class_=lambda c: c and ('badge' in c.lower() or 'verified' in c.lower())):
+            badge.decompose()
+        name = h1.get_text(strip=True)
+        name = re.sub(r'\s*Verified\s*', '', name).strip()
+        data['companyName'] = name
 
-async def _try_extract_website_from_sidebar(page) -> str | None:
-    """Try to extract website URL from the sidebar or company info section."""
-    try:
-        # Look for external links in the company info area
-        links = page.locator('a[target="_blank"][rel*="nofollow"]')
-        count = await links.count()
-        for i in range(count):
-            href = await links.nth(i).get_attribute('href')
-            if href and not any(domain in href for domain in [
-                'europages', 'google', 'facebook', 'linkedin',
-                'twitter', 'instagram', 'youtube', 'maps.google'
-            ]):
-                return href
-        return None
-    except Exception:
-        return None
+    # --- EMAIL ---
+    # Look for mailto: links
+    mailto_links = soup.find_all('a', href=re.compile(r'^mailto:', re.IGNORECASE))
+    for link in mailto_links:
+        email = link['href'].replace('mailto:', '').split('?')[0].strip()
+        if email and '@' in email:
+            data['email'] = email
+            break
 
+    # Fallback: search entire page text for email patterns
+    if not data['email']:
+        email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
+        if email_match:
+            email = email_match.group(0)
+            if 'europages' not in email and 'example.com' not in email:
+                data['email'] = email
 
-async def _try_extract_country(page) -> str | None:
-    """Try to extract country from the page header."""
-    try:
-        # Look for flag emojis or country text near the company header
-        header = page.locator('h1').first
-        if await header.count() > 0:
-            parent = header.locator('..')
-            text = await parent.inner_text()
+    # --- WEBSITE ---
+    # Look for external links (not to europages, social media, etc.)
+    excluded_domains = ['europages', 'google', 'facebook', 'linkedin', 'twitter', 'instagram', 'youtube']
+    for a_tag in soup.find_all('a', href=True, target='_blank'):
+        href = a_tag['href']
+        if href.startswith(('http://', 'https://')) and not any(d in href for d in excluded_domains):
+            data['website'] = href
+            break
+
+    # Fallback: Look for links with "website" in text
+    if not data['website']:
+        for a_tag in soup.find_all('a', href=True):
+            text = a_tag.get_text(strip=True).lower()
+            href = a_tag['href']
+            if ('website' in text or 'web site' in text or 'visit' in text) and \
+               href.startswith(('http://', 'https://')) and \
+               not any(d in href for d in excluded_domains):
+                data['website'] = href
+                break
+
+    # --- PHONE NUMBER ---
+    # Look for tel: links
+    tel_links = soup.find_all('a', href=re.compile(r'^tel:', re.IGNORECASE))
+    for link in tel_links:
+        phone = link['href'].replace('tel:', '').strip()
+        if phone:
+            data['phoneNumber'] = phone
+            break
+
+    # Fallback: look for phone patterns in page
+    if not data['phoneNumber']:
+        phone_match = re.search(
+            r'(?:Phone|Tel|Telephone|Fax)[:\s]*([+\d\s().-]{7,20})',
+            soup.get_text(), re.IGNORECASE
+        )
+        if phone_match:
+            data['phoneNumber'] = phone_match.group(1).strip()
+
+    # --- COUNTRY ---
+    country_el = soup.find(class_=re.compile(r'country', re.IGNORECASE))
+    if country_el:
+        data['country'] = country_el.get_text(strip=True)
+
+    # Fallback: look for known countries in header area
+    if not data['country'] and h1:
+        parent = h1.parent
+        if parent:
+            parent_text = parent.get_text()
             countries = [
                 'Germany', 'France', 'Italy', 'Spain', 'Poland', 'Netherlands',
                 'Belgium', 'Austria', 'Switzerland', 'United Kingdom', 'Portugal',
@@ -634,98 +295,68 @@ async def _try_extract_country(page) -> str | None:
                 'Latvia', 'Estonia', 'Luxembourg', 'Malta', 'Cyprus',
             ]
             for country in countries:
-                if country in text:
-                    return country
-        return None
-    except Exception:
-        return None
+                if country in parent_text:
+                    data['country'] = country
+                    break
 
+    # --- ADDRESS ---
+    addr_el = soup.find(class_=re.compile(r'address', re.IGNORECASE))
+    if addr_el:
+        data['address'] = re.sub(r'\s+', ' ', addr_el.get_text(strip=True))
+    if not data['address']:
+        addr_tag = soup.find('address')
+        if addr_tag:
+            data['address'] = re.sub(r'\s+', ' ', addr_tag.get_text(strip=True))
 
-async def _try_extract_address(page) -> str | None:
-    """Try to extract address from the header or company info section."""
-    try:
-        # EuroPages shows address near the country flag
-        header_area = page.locator('h1').first.locator('..')
-        if await header_area.count() > 0:
-            text = await header_area.inner_text()
-            # Look for text after country name that contains postal code patterns
-            addr_match = re.search(
-                r'(?:[\w\s]+,\s+)?[\w\s.]+\d{4,5}[\s,-]+[\w\s]+',
-                text
-            )
-            if addr_match:
-                return addr_match.group(0).strip()
+    # --- DESCRIPTION ---
+    desc_el = soup.find(class_=re.compile(r'description', re.IGNORECASE))
+    if desc_el:
+        data['description'] = desc_el.get_text(strip=True)[:500]
+    if not data['description']:
+        meta_desc = soup.find('meta', attrs={'name': 'description'})
+        if meta_desc and meta_desc.get('content'):
+            data['description'] = meta_desc['content'][:500]
 
-        # Try the Company Information sidebar
-        info_text = await page.locator('text=Location').first.locator('..').inner_text()
-        if info_text and 'Location' in info_text:
-            addr = info_text.replace('Location', '').strip()
-            if addr:
-                return addr
+    # --- COMPANY TYPE ---
+    type_keywords = [
+        'Manufacturer', 'Distributor', 'Service provider',
+        'Wholesaler', 'Retailer', 'Subcontractor', 'Agent',
+    ]
+    page_text = soup.get_text()
+    for keyword in type_keywords:
+        if keyword in page_text:
+            data['companyType'] = keyword
+            break
 
-        return None
-    except Exception:
-        return None
+    # Clean up the data
+    return _clean_company_data(data)
 
 
 def _is_company_url(url: str) -> bool:
     """Check if a URL is a EuroPages company detail page."""
-    return bool(re.search(r'/[A-Z0-9][^/]*/SEAC\d+-\d+\.html', url))
-
-
-def _extract_page_number(url: str) -> int:
-    """Extract the current page number from a URL."""
-    match = re.search(r'[?&]page=(\d+)', url)
-    if match:
-        return int(match.group(1))
-    # Some URLs use /pg-N/ pattern
-    match = re.search(r'/pg-(\d+)/', url)
-    if match:
-        return int(match.group(1))
-    return 1
-
-
-def _build_next_page_url(current_url: str, next_page: int) -> str | None:
-    """Build the URL for the next listing page."""
-    if 'page=' in current_url:
-        return re.sub(r'page=\d+', f'page={next_page}', current_url)
-    elif '?' in current_url:
-        return f'{current_url}&page={next_page}'
-    else:
-        # Remove .html and add page parameter
-        if current_url.endswith('.html'):
-            return f'{current_url}?page={next_page}'
-        return f'{current_url}?page={next_page}'
+    return bool(re.search(r'/[A-Za-z0-9][^/]*/SEAC\d+-\d+\.html', url))
 
 
 def _clean_company_data(data: dict) -> dict:
     """Clean and validate scraped company data."""
     cleaned = {}
-
     for key, value in data.items():
         if isinstance(value, str):
-            # Strip whitespace and normalize
             value = value.strip()
             value = re.sub(r'\s+', ' ', value)
 
-            # Remove common noise
             if key == 'companyName':
                 value = re.sub(r'\s*Verified\s*', '', value).strip()
                 value = re.sub(r'\s*✓\s*', '', value).strip()
 
             if key == 'phoneNumber':
-                # Clean phone number format
-                value = value.strip()
-                # Remove "Show Number" or similar text
                 value = re.sub(r'(?i)show\s*(phone|number|tel)', '', value).strip()
 
             if key == 'email':
-                # Validate email format
                 if not re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', value):
                     value = ''
 
             if key == 'website':
-                # Ensure it's a valid URL
                 if not value.startswith(('http://', 'https://')):
                     if value and '.' in value:
                         value = f'https://{value}'
@@ -733,5 +364,4 @@ def _clean_company_data(data: dict) -> dict:
                         value = ''
 
         cleaned[key] = value if value else ''
-
     return cleaned

@@ -42,31 +42,58 @@ HEADERS = {
 
 async def main() -> None:
     """Main entry point for the Apify Actor."""
-    # Try to use Apify SDK if available, otherwise fall back to env vars
-    try:
-        from apify import Actor
-        async with Actor:
-            actor_input = await Actor.get_input() or {}
-            results = await run_scraper(actor_input)
+    # Use Apify REST API directly to avoid SDK version conflicts
+    apify_token = os.environ.get('APIFY_TOKEN', '')
+    dataset_id = os.environ.get('APIFY_DEFAULT_DATASET_ID', '')
+    kv_store_id = os.environ.get('APIFY_DEFAULT_KEY_VALUE_STORE_ID', '')
+
+    # Read input from key-value store or local file
+    actor_input = {}
+    if apify_token and kv_store_id:
+        log.info('Running on Apify platform')
+        async with httpx.AsyncClient() as api_client:
+            try:
+                resp = await api_client.get(
+                    f'https://api.apify.com/v2/key-value-stores/{kv_store_id}/records/INPUT',
+                    params={'token': apify_token},
+                )
+                if resp.status_code == 200:
+                    actor_input = resp.json()
+            except Exception as e:
+                log.warning(f'Failed to read input: {e}')
+    else:
+        # Local mode - read from storage
+        input_path = os.path.join('storage', 'key_value_stores', 'default', 'INPUT.json')
+        if os.path.exists(input_path):
+            with open(input_path) as f:
+                actor_input = json.load(f)
+
+    log.info(f'Input: {json.dumps(actor_input, indent=2)}')
+
+    # Run the scraper
+    results = await run_scraper(actor_input)
+
+    # Push results to dataset
+    if apify_token and dataset_id:
+        async with httpx.AsyncClient() as api_client:
             for item in results:
-                await Actor.push_data(item)
-            Actor.log.info(f'Scraping complete! Found {len(results)} companies.')
-    except ImportError:
-        log.info('Apify SDK not available, running standalone...')
-        # Read input from environment or default
-        input_json = os.environ.get('ACTOR_INPUT', '{}')
-        actor_input = json.loads(input_json) if input_json else {}
-        results = await run_scraper(actor_input)
-        # Save results to dataset
+                try:
+                    await api_client.post(
+                        f'https://api.apify.com/v2/datasets/{dataset_id}/items',
+                        params={'token': apify_token},
+                        json=[item],
+                    )
+                except Exception as e:
+                    log.error(f'Failed to push data: {e}')
+    else:
+        # Save locally
         dataset_dir = os.path.join('storage', 'datasets', 'default')
         os.makedirs(dataset_dir, exist_ok=True)
         for i, item in enumerate(results):
             with open(os.path.join(dataset_dir, f'{i:06d}.json'), 'w') as f:
                 json.dump(item, f, indent=2)
-        log.info(f'Scraping complete! Found {len(results)} companies.')
-    except Exception as e:
-        log.error(f'Actor failed: {e}')
-        raise
+
+    log.info(f'Scraping complete! Pushed {len(results)} companies to dataset.')
 
 
 async def run_scraper(actor_input: dict) -> list[dict]:
@@ -221,22 +248,29 @@ async def scrape_company_page(client: httpx.AsyncClient, url: str) -> dict:
         name = re.sub(r'\s*Verified\s*', '', name).strip()
         data['companyName'] = name
 
+    # Domains to exclude from email matching (tracking, analytics, etc.)
+    excluded_email_domains = [
+        'europages', 'example.com', 'sentry.io', 'sentry-next',
+        'googleapis', 'google.com', 'facebook.com', 'hotjar.com',
+        'segment.io', 'mixpanel.com', 'intercom.io',
+    ]
+
     # --- EMAIL ---
     # Look for mailto: links
     mailto_links = soup.find_all('a', href=re.compile(r'^mailto:', re.IGNORECASE))
     for link in mailto_links:
         email = link['href'].replace('mailto:', '').split('?')[0].strip()
-        if email and '@' in email:
+        if email and '@' in email and not any(d in email.lower() for d in excluded_email_domains):
             data['email'] = email
             break
 
     # Fallback: search entire page text for email patterns
     if not data['email']:
-        email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
-        if email_match:
-            email = email_match.group(0)
-            if 'europages' not in email and 'example.com' not in email:
+        email_matches = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', html)
+        for email in email_matches:
+            if not any(d in email.lower() for d in excluded_email_domains):
                 data['email'] = email
+                break
 
     # --- WEBSITE ---
     # Look for external links (not to europages, social media, etc.)

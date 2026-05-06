@@ -1,10 +1,10 @@
-"""EuroPages Company Scraper - Full contact extraction with Playwright.
+"""EuroPages Company Scraper - Extracts contacts from company websites.
 
-Scrapes company data from europages.co.uk including:
-- Company name, Email, Website, Phone number
-- Country, Address, Description, Company type
+Strategy:
+1. Scrape EuroPages listings to get company names + website URLs
+2. Visit each company's own website to extract phone & email from footer/contact sections
 
-Uses Playwright for browser rendering to extract hidden contact info.
+Uses Playwright for browser rendering to handle dynamic company websites.
 Uses Apify REST API directly to avoid SDK dependency conflicts.
 """
 
@@ -19,7 +19,6 @@ from urllib.parse import quote_plus, urljoin
 
 import httpx
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger('europages-scraper')
 
@@ -53,25 +52,21 @@ async def main() -> None:
                 actor_input = json.load(f)
 
     log.info(f'Input: {json.dumps(actor_input, indent=2)}')
-
-    # Run the scraper
     results = await run_scraper(actor_input)
 
     # Push results to Apify dataset
-    if apify_token and dataset_id:
+    if apify_token and dataset_id and results:
         async with httpx.AsyncClient() as api_client:
-            # Push all results in one batch
-            if results:
-                try:
-                    resp = await api_client.post(
-                        f'https://api.apify.com/v2/datasets/{dataset_id}/items',
-                        params={'token': apify_token},
-                        json=results,
-                        timeout=30.0,
-                    )
-                    log.info(f'Pushed {len(results)} items to dataset (status: {resp.status_code})')
-                except Exception as e:
-                    log.error(f'Failed to push data: {e}')
+            try:
+                resp = await api_client.post(
+                    f'https://api.apify.com/v2/datasets/{dataset_id}/items',
+                    params={'token': apify_token},
+                    json=results,
+                    timeout=30.0,
+                )
+                log.info(f'Pushed {len(results)} items to dataset (status: {resp.status_code})')
+            except Exception as e:
+                log.error(f'Failed to push data: {e}')
     else:
         dataset_dir = os.path.join('storage', 'datasets', 'default')
         os.makedirs(dataset_dir, exist_ok=True)
@@ -79,11 +74,11 @@ async def main() -> None:
             with open(os.path.join(dataset_dir, f'{i:06d}.json'), 'w') as f:
                 json.dump(item, f, indent=2)
 
-    log.info(f'Done! {len(results)} companies with contact info.')
+    log.info(f'Done! {len(results)} leads with contact info.')
 
 
 async def run_scraper(actor_input: dict) -> list[dict]:
-    """Run the EuroPages scraper with Playwright browser."""
+    """Run the two-step scraper: EuroPages → Company websites."""
     search_query = actor_input.get('searchQuery', 'construction')
     start_urls = actor_input.get('startUrls', [])
     max_results = actor_input.get('maxResults', 100)
@@ -101,7 +96,7 @@ async def run_scraper(actor_input: dict) -> list[dict]:
             locale='en-US',
         )
 
-        # Build URL list
+        # ─── STEP 1: Collect company data from EuroPages ───
         if start_urls:
             listing_urls = []
             for url_item in start_urls:
@@ -110,37 +105,53 @@ async def run_scraper(actor_input: dict) -> list[dict]:
         else:
             listing_urls = [f'{BASE_URL}/companies/{quote_plus(search_query)}.html']
 
-        # Step 1: Collect company URLs from listing pages
-        company_urls = []
+        companies = []
         for listing_url in listing_urls:
             if _is_company_url(listing_url):
-                company_urls.append(listing_url)
+                companies.append({'europagesUrl': listing_url})
             else:
-                found = await scrape_listing_pages(context, listing_url, max_pages, max_results - len(company_urls))
-                company_urls.extend(found)
-                if 0 < max_results <= len(company_urls):
-                    company_urls = company_urls[:max_results]
+                found = await scrape_europages_listings(context, listing_url, max_pages, max_results - len(companies))
+                companies.extend(found)
+                if 0 < max_results <= len(companies):
+                    companies = companies[:max_results]
                     break
 
-        log.info(f'Collected {len(company_urls)} company URLs')
+        log.info(f'═══ Step 1 complete: {len(companies)} companies from EuroPages ═══')
 
-        # Step 2: Scrape each company detail page with browser
-        for i, url in enumerate(company_urls):
+        # ─── STEP 2: Visit each company's EuroPages page to get website + basic info ───
+        for i, company in enumerate(companies):
             if 0 < max_results <= len(results):
                 break
             try:
-                log.info(f'[{i+1}/{len(company_urls)}] Scraping: {url}')
-                data = await scrape_company_page(context, url)
-                if data and data.get('companyName'):
-                    results.append(data)
-                    log.info(
-                        f'  ✓ {data["companyName"]} | '
-                        f'Phone: {data.get("phoneNumber") or "—"} | '
-                        f'Email: {data.get("email") or "—"} | '
-                        f'Web: {data.get("website") or "—"}'
-                    )
-                else:
-                    log.warning(f'  ✗ No data from {url}')
+                log.info(f'[{i+1}/{len(companies)}] EuroPages: {company["europagesUrl"]}')
+                ep_data = await scrape_europages_detail(context, company['europagesUrl'])
+                company.update(ep_data)
+
+                if not company.get('website'):
+                    log.warning(f'  ✗ No website found, skipping')
+                    continue
+
+                log.info(f'  Company: {company.get("companyName", "?")} | Website: {company["website"]}')
+
+                # ─── STEP 3: Visit the company's OWN website to get phone & email ───
+                log.info(f'  → Visiting company website: {company["website"]}')
+                contacts = await scrape_company_website(context, company['website'])
+                company['email'] = contacts.get('email', '')
+                company['phoneNumber'] = contacts.get('phoneNumber', '')
+
+                # Use website contacts as fallback for address
+                if not company.get('address') and contacts.get('address'):
+                    company['address'] = contacts['address']
+
+                company = _clean_data(company)
+                results.append(company)
+
+                log.info(
+                    f'  ✓ {company.get("companyName", "?")} | '
+                    f'Phone: {company.get("phoneNumber") or "—"} | '
+                    f'Email: {company.get("email") or "—"}'
+                )
+
             except Exception as e:
                 log.error(f'  ✗ Error: {e}')
 
@@ -149,14 +160,16 @@ async def run_scraper(actor_input: dict) -> list[dict]:
     return results
 
 
-async def scrape_listing_pages(context, base_url: str, max_pages: int, max_items: int) -> list[str]:
-    """Use browser to scrape listing pages and collect company URLs."""
-    company_urls = []
+# ─── EUROPAGES SCRAPING ───────────────────────────────────────────────────────
+
+async def scrape_europages_listings(context, base_url: str, max_pages: int, max_items: int) -> list[dict]:
+    """Scrape EuroPages listing pages to collect company URLs."""
+    companies = []
     page = await context.new_page()
 
     try:
         for page_num in range(1, max_pages + 1):
-            if 0 < max_items <= len(company_urls):
+            if 0 < max_items <= len(companies):
                 break
 
             url = base_url if page_num == 1 else f'{base_url}{"&" if "?" in base_url else "?"}page={page_num}'
@@ -166,13 +179,11 @@ async def scrape_listing_pages(context, base_url: str, max_pages: int, max_items
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
                 await page.wait_for_timeout(2000)
             except Exception as e:
-                log.error(f'Failed to load listing page: {e}')
+                log.error(f'Failed to load listing: {e}')
                 break
 
-            # Dismiss cookie banner
             await _dismiss_cookies(page)
 
-            # Extract company links using JavaScript
             links = await page.evaluate('''() => {
                 const urls = new Set();
                 for (const a of document.querySelectorAll('a[href]')) {
@@ -186,51 +197,36 @@ async def scrape_listing_pages(context, base_url: str, max_pages: int, max_items
             }''')
 
             log.info(f'  Found {len(links)} company links')
-
             for link in links:
-                if link not in company_urls:
-                    company_urls.append(link)
+                if not any(c['europagesUrl'] == link for c in companies):
+                    companies.append({'europagesUrl': link})
 
             if len(links) == 0:
-                log.info('  No more links, stopping pagination')
                 break
 
     finally:
         await page.close()
 
-    return company_urls
+    return companies
 
 
-async def scrape_company_page(context, url: str) -> dict:
-    """Scrape a single company page using browser to get full contact info."""
+async def scrape_europages_detail(context, url: str) -> dict:
+    """Scrape a EuroPages company page for basic info + website URL."""
     page = await context.new_page()
-    data = {
-        'companyName': '', 'email': '', 'website': '',
-        'phoneNumber': '', 'country': '', 'address': '',
-        'description': '', 'companyType': '', 'europagesUrl': url,
-    }
+    data = {}
 
     try:
         await page.goto(url, wait_until='domcontentloaded', timeout=30000)
         await page.wait_for_timeout(2000)
-
-        # Dismiss cookies
         await _dismiss_cookies(page)
-        await page.wait_for_timeout(500)
 
-        # Click ALL "Show number" / reveal buttons to unhide phone numbers
-        await _click_reveal_buttons(page)
-        await page.wait_for_timeout(2000)
-
-        # Extract all data using comprehensive JavaScript
-        extracted = await page.evaluate('''() => {
+        data = await page.evaluate('''() => {
             const result = {
-                companyName: '', email: '', website: '',
-                phoneNumber: '', country: '', address: '',
-                description: '', companyType: '',
+                companyName: '', website: '', country: '',
+                address: '', companyType: '', description: '',
             };
 
-            // ── COMPANY NAME ──
+            // Company name from h1
             const h1 = document.querySelector('h1');
             if (h1) {
                 let name = '';
@@ -241,111 +237,12 @@ async def scrape_company_page(context, url: str) -> dict:
                 result.companyName = name.replace(/Verified/gi, '').replace(/✓/g, '').trim();
             }
 
-            // ── EMAIL ──
-            const excludeDomains = ['europages', 'sentry.io', 'googleapis', 'google.com',
-                'facebook.com', 'hotjar.com', 'segment.io', 'mixpanel', 'intercom',
-                'cloudflare', 'example.com', 'wixpress'];
-
-            // Check mailto links
-            for (const a of document.querySelectorAll('a[href^="mailto:"]')) {
-                const email = a.href.replace('mailto:', '').split('?')[0].trim();
-                if (email && email.includes('@') && !excludeDomains.some(d => email.includes(d))) {
-                    result.email = email;
-                    break;
-                }
-            }
-
-            // Fallback: scan visible text for email patterns
-            if (!result.email) {
-                const bodyText = document.body.innerText;
-                const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
-                const matches = bodyText.match(emailRegex) || [];
-                for (const m of matches) {
-                    if (!excludeDomains.some(d => m.toLowerCase().includes(d))) {
-                        result.email = m;
-                        break;
-                    }
-                }
-            }
-
-            // ── PHONE NUMBER ──
-            // EuroPages uses Tippy.js popovers - check .tippy-content first
-            const tippyEls = document.querySelectorAll(
-                '.tippy-content, .tippy-box, [data-tippy-root], ' +
-                '[role="tooltip"], [class*="popover"], [class*="Popover"]'
-            );
-            for (const el of tippyEls) {
-                const text = el.innerText || el.textContent || '';
-                const match = text.match(/[+]?[\d\s()\-\.]{7,25}/);
-                if (match) {
-                    const phone = match[0].trim();
-                    if (phone.replace(/\D/g, '').length >= 7) {
-                        result.phoneNumber = phone;
-                        break;
-                    }
-                }
-            }
-
-            // Also check span.font-copy-400 inside tippy (exact EuroPages structure)
-            if (!result.phoneNumber) {
-                const fontCopyEls = document.querySelectorAll('.tippy-content .font-copy-400, .tippy-content span');
-                for (const el of fontCopyEls) {
-                    const text = el.textContent.trim();
-                    if (text.match(/^[+]?[\d\s()\-\.]{7,25}$/) && text.replace(/\D/g, '').length >= 7) {
-                        result.phoneNumber = text;
-                        break;
-                    }
-                }
-            }
-
-            // Check tel: links (including ones revealed by clicking)
-            if (!result.phoneNumber) {
-                for (const a of document.querySelectorAll('a[href^="tel:"]')) {
-                    const phone = a.href.replace('tel:', '').trim();
-                    if (phone && phone.length >= 7) {
-                        result.phoneNumber = phone;
-                        break;
-                    }
-                }
-            }
-
-            // Look for phone text near "Phone" / "Tel" labels
-            if (!result.phoneNumber) {
-                const allText = document.body.innerText;
-                const phoneMatch = allText.match(/(?:Phone|Tel|Telephone|Mobile)[:\s]*([+\d\s()\-\.]{7,25})/i);
-                if (phoneMatch) {
-                    result.phoneNumber = phoneMatch[1].trim();
-                }
-            }
-
-            // Check phone-related class elements
-            if (!result.phoneNumber) {
-                const phoneEls = document.querySelectorAll(
-                    '[class*="phone" i], [class*="tel" i], [data-testid*="phone"]'
-                );
-                for (const el of phoneEls) {
-                    const text = el.innerText.trim();
-                    const match = text.match(/[+]?[\d\s()\-\.]{7,25}/);
-                    if (match && match[0].replace(/\D/g, '').length >= 7) {
-                        result.phoneNumber = match[0].trim();
-                        break;
-                    }
-                }
-            }
-
-            // Scan entire visible page for phone number patterns (last resort)
-            if (!result.phoneNumber) {
-                const bodyText = document.body.innerText;
-                const intlPhoneMatch = bodyText.match(/\+\d{1,3}[\s\-\.]?\(?\d{1,4}\)?[\s\-\.]?\d{3,10}[\s\-\.]?\d{0,10}/);
-                if (intlPhoneMatch) {
-                    result.phoneNumber = intlPhoneMatch[0].trim();
-                }
-            }
-
-            // ── WEBSITE ──
+            // Website - look for external links (the "Visit website" button)
             const skipDomains = ['europages', 'google', 'facebook', 'linkedin',
-                'twitter', 'instagram', 'youtube', 'maps.google', 'apple.com'];
+                'twitter', 'instagram', 'youtube', 'maps.google', 'apple.com',
+                'play.google'];
 
+            // First try: links opening in new tab (Visit website button)
             for (const a of document.querySelectorAll('a[target="_blank"][href^="http"]')) {
                 const href = a.href;
                 if (!skipDomains.some(d => href.includes(d))) {
@@ -353,10 +250,12 @@ async def scrape_company_page(context, url: str) -> dict:
                     break;
                 }
             }
+
+            // Second try: any external link not to excluded domains
             if (!result.website) {
                 for (const a of document.querySelectorAll('a[href^="http"]')) {
-                    const text = (a.textContent || '').toLowerCase();
                     const href = a.href;
+                    const text = (a.textContent || '').toLowerCase();
                     if ((text.includes('website') || text.includes('visit') || text.includes('www'))
                         && !skipDomains.some(d => href.includes(d))) {
                         result.website = href;
@@ -365,7 +264,7 @@ async def scrape_company_page(context, url: str) -> dict:
                 }
             }
 
-            // ── COUNTRY ──
+            // Country
             const countryEl = document.querySelector('[class*="country" i]');
             if (countryEl) result.country = countryEl.textContent.trim();
 
@@ -381,141 +280,256 @@ async def scrape_company_page(context, url: str) -> dict:
                 }
             }
 
-            // ── ADDRESS ──
-            // EuroPages puts address in font-copy-400 text-neutral-100 below company name
+            // Address from header area
             const addrEls = document.querySelectorAll('.font-copy-400.text-neutral-100');
             for (const el of addrEls) {
                 const text = el.textContent.trim();
-                // Address usually contains commas, numbers, or street indicators
-                if (text && (text.includes(',') || /\d{4,5}/.test(text) || text.length > 10)) {
-                    result.address = text.replace(/\s+/g, ' ');
+                if (text && !text.includes('Manufacturer') && !text.includes('Distributor')
+                    && !text.includes('Service provider') && !text.includes('Wholesaler')
+                    && !text.includes('Retailer') && (text.includes(',') || /\\d{4,5}/.test(text))) {
+                    result.address = text.replace(/\\s+/g, ' ');
                     break;
                 }
             }
-            // Fallback to generic address selectors
-            if (!result.address) {
-                const addrEl = document.querySelector('[class*="address" i], address');
-                if (addrEl) result.address = addrEl.textContent.trim().replace(/\s+/g, ' ');
-            }
 
-            // ── DESCRIPTION ──
-            const descEl = document.querySelector('[class*="description" i]');
-            if (descEl) result.description = descEl.textContent.trim().substring(0, 500);
-            if (!result.description) {
-                const meta = document.querySelector('meta[name="description"]');
-                if (meta) result.description = (meta.content || '').substring(0, 500);
-            }
-
-            // ── COMPANY TYPE ──
+            // Company type
             const types = ['Manufacturer','Distributor','Service provider',
                 'Wholesaler','Retailer','Subcontractor','Agent'];
-            const bodyText2 = document.body.innerText;
+            const bodyText = document.body.innerText;
             for (const t of types) {
-                if (bodyText2.includes(t)) { result.companyType = t; break; }
+                if (bodyText.includes(t)) { result.companyType = t; break; }
+            }
+
+            // Description from meta
+            const meta = document.querySelector('meta[name="description"]');
+            if (meta && meta.content) {
+                const desc = meta.content.trim();
+                if (!desc.includes('europages app') && !desc.includes('supplier search')) {
+                    result.description = desc.substring(0, 500);
+                }
             }
 
             return result;
         }''')
 
-        # Merge extracted data
-        for key, value in extracted.items():
-            if value:
-                data[key] = value.strip()
-
-        # Clean data
-        data = _clean_data(data)
-
     except Exception as e:
-        log.error(f'Error scraping {url}: {e}')
+        log.error(f'Error scraping EuroPages detail: {e}')
     finally:
         await page.close()
 
     return data
 
 
+# ─── COMPANY WEBSITE SCRAPING ─────────────────────────────────────────────────
+
+async def scrape_company_website(context, website_url: str) -> dict:
+    """Visit a company's own website and extract phone & email from footer/contact page."""
+    contacts = {'email': '', 'phoneNumber': '', 'address': ''}
+    page = await context.new_page()
+
+    try:
+        # Visit the company website
+        await page.goto(website_url, wait_until='domcontentloaded', timeout=20000)
+        await page.wait_for_timeout(3000)
+
+        # Try dismissing cookie banners on the company site too
+        await _dismiss_cookies(page)
+        await page.wait_for_timeout(1000)
+
+        # Scroll to the bottom to load footer content
+        await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+        await page.wait_for_timeout(2000)
+
+        # Extract contacts from the page (especially footer)
+        page_contacts = await _extract_contacts_from_page(page)
+        if page_contacts.get('email'):
+            contacts['email'] = page_contacts['email']
+        if page_contacts.get('phoneNumber'):
+            contacts['phoneNumber'] = page_contacts['phoneNumber']
+        if page_contacts.get('address'):
+            contacts['address'] = page_contacts['address']
+
+        # If no email/phone found, try visiting /contact or /contacts page
+        if not contacts['email'] or not contacts['phoneNumber']:
+            contact_page_url = await _find_contact_page_link(page)
+            if contact_page_url:
+                log.info(f'    → Visiting contact page: {contact_page_url}')
+                try:
+                    await page.goto(contact_page_url, wait_until='domcontentloaded', timeout=15000)
+                    await page.wait_for_timeout(2000)
+                    await _dismiss_cookies(page)
+
+                    contact_page_data = await _extract_contacts_from_page(page)
+                    if not contacts['email'] and contact_page_data.get('email'):
+                        contacts['email'] = contact_page_data['email']
+                    if not contacts['phoneNumber'] and contact_page_data.get('phoneNumber'):
+                        contacts['phoneNumber'] = contact_page_data['phoneNumber']
+                    if not contacts['address'] and contact_page_data.get('address'):
+                        contacts['address'] = contact_page_data['address']
+                except Exception:
+                    pass
+
+    except Exception as e:
+        log.warning(f'    Failed to scrape website {website_url}: {e}')
+    finally:
+        await page.close()
+
+    return contacts
+
+
+async def _extract_contacts_from_page(page) -> dict:
+    """Extract email, phone, and address from any web page."""
+    return await page.evaluate('''() => {
+        const result = { email: '', phoneNumber: '', address: '' };
+
+        const excludeEmailDomains = [
+            'europages', 'sentry.io', 'googleapis', 'google.com',
+            'facebook.com', 'hotjar.com', 'segment.io', 'mixpanel',
+            'intercom', 'cloudflare', 'example.com', 'wixpress',
+            'w3.org', 'schema.org', 'gravatar.com', 'wordpress',
+        ];
+
+        // ── EMAIL ──
+        // Priority 1: mailto links
+        for (const a of document.querySelectorAll('a[href^="mailto:"]')) {
+            const email = a.href.replace('mailto:', '').split('?')[0].trim().toLowerCase();
+            if (email && email.includes('@') && !excludeEmailDomains.some(d => email.includes(d))) {
+                result.email = email;
+                break;
+            }
+        }
+
+        // Priority 2: email text in footer
+        if (!result.email) {
+            const footerEls = document.querySelectorAll('footer, [class*="footer" i], [id*="footer" i], [class*="contact" i]');
+            const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
+            for (const el of footerEls) {
+                const matches = el.innerText.match(emailRegex) || [];
+                for (const m of matches) {
+                    if (!excludeEmailDomains.some(d => m.toLowerCase().includes(d))) {
+                        result.email = m.toLowerCase();
+                        break;
+                    }
+                }
+                if (result.email) break;
+            }
+        }
+
+        // Priority 3: email anywhere on page
+        if (!result.email) {
+            const allText = document.body.innerText;
+            const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
+            const matches = allText.match(emailRegex) || [];
+            for (const m of matches) {
+                if (!excludeEmailDomains.some(d => m.toLowerCase().includes(d))) {
+                    result.email = m.toLowerCase();
+                    break;
+                }
+            }
+        }
+
+        // ── PHONE ──
+        // Priority 1: tel: links
+        for (const a of document.querySelectorAll('a[href^="tel:"]')) {
+            const phone = a.href.replace('tel:', '').replace(/%20/g, ' ').trim();
+            if (phone && phone.replace(/\\D/g, '').length >= 7) {
+                result.phoneNumber = phone;
+                break;
+            }
+        }
+
+        // Priority 2: phone text in footer/contact sections
+        if (!result.phoneNumber) {
+            const contactEls = document.querySelectorAll(
+                'footer, [class*="footer" i], [id*="footer" i], [class*="contact" i], ' +
+                '[class*="phone" i], [class*="tel" i]'
+            );
+            for (const el of contactEls) {
+                const text = el.innerText;
+                // Match international phone formats
+                const phoneMatch = text.match(/(?:Phone|Tel|Telephone|Fax|Mobile|Call)[:\\s]*([+\\d][\\d\\s()\\-\\.]{6,24})/i);
+                if (phoneMatch) {
+                    const phone = phoneMatch[1].trim();
+                    if (phone.replace(/\\D/g, '').length >= 7) {
+                        result.phoneNumber = phone;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Priority 3: any tel: pattern or international phone in visible text
+        if (!result.phoneNumber) {
+            const bodyText = document.body.innerText;
+            const intlMatch = bodyText.match(/(?:^|\\s)(\\+\\d{1,3}[\\s\\-\\.]?\\(?\\d{1,4}\\)?[\\s\\-\\.]?\\d{2,10}[\\s\\-\\.]?\\d{0,10})(?:\\s|$)/m);
+            if (intlMatch) {
+                const phone = intlMatch[1].trim();
+                if (phone.replace(/\\D/g, '').length >= 7) {
+                    result.phoneNumber = phone;
+                }
+            }
+        }
+
+        // ── ADDRESS ──
+        // Check footer for address patterns
+        const footerArea = document.querySelector('footer, [class*="footer" i]');
+        if (footerArea) {
+            const addrEl = footerArea.querySelector('address, [class*="address" i]');
+            if (addrEl) {
+                result.address = addrEl.textContent.trim().replace(/\\s+/g, ' ').substring(0, 200);
+            }
+        }
+
+        return result;
+    }''')
+
+
+async def _find_contact_page_link(page) -> str | None:
+    """Find a link to the Contact page on a company website."""
+    return await page.evaluate('''() => {
+        const contactKeywords = ['contact', 'contatti', 'kontakt', 'contacto',
+            'nous contacter', 'contactez', 'get in touch', 'reach us'];
+
+        for (const a of document.querySelectorAll('a[href]')) {
+            const text = (a.textContent || '').toLowerCase().trim();
+            const href = (a.getAttribute('href') || '').toLowerCase();
+
+            for (const keyword of contactKeywords) {
+                if (text.includes(keyword) || href.includes(keyword)) {
+                    const fullUrl = a.href; // browser resolves relative URLs
+                    if (fullUrl && fullUrl.startsWith('http')) {
+                        return fullUrl;
+                    }
+                }
+            }
+        }
+        return null;
+    }''')
+
+
+# ─── UTILITIES ────────────────────────────────────────────────────────────────
+
 async def _dismiss_cookies(page) -> None:
     """Dismiss cookie consent banner."""
     selectors = [
         'button:has-text("Accept")', 'button:has-text("Accept all")',
         'button:has-text("Accept All")', 'button:has-text("I agree")',
-        'button:has-text("OK")', '#onetrust-accept-btn-handler',
-        'button[id*="cookie" i]', '.cookie-banner button',
+        'button:has-text("OK")', 'button:has-text("Accetta")',
+        'button:has-text("Akzeptieren")', 'button:has-text("Aceptar")',
+        '#onetrust-accept-btn-handler', 'button[id*="cookie" i]',
+        '.cookie-banner button', '[class*="cookie"] button',
+        'button:has-text("Agree")', 'button:has-text("Got it")',
+        'button:has-text("Allow")', 'button:has-text("Consent")',
     ]
     for sel in selectors:
         try:
             btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1000):
+            if await btn.is_visible(timeout=800):
                 await btn.click(timeout=2000)
                 await page.wait_for_timeout(500)
                 return
         except Exception:
             continue
-
-
-async def _click_reveal_buttons(page) -> None:
-    """Click EuroPages buttons that reveal hidden contact info (phone, email).
-
-    EuroPages has buttons like 'Phone Number', 'Show Number' in the Contacts
-    section. Clicking them opens popovers with the actual data.
-    """
-    # EuroPages-specific selectors - ordered by priority
-    reveal_selectors = [
-        # EuroPages phone reveal buttons
-        'button:has-text("Phone Number")',
-        'button:has-text("Phone number")',
-        'button:has-text("phone number")',
-        # EuroPages show number buttons (VAT, phone, etc.)
-        'button:has-text("Show Number")',
-        'button:has-text("Show number")',
-        'button:has-text("show number")',
-        # Subtle/outline buttons in contacts area
-        'button.btn--subtle:has-text("Phone")',
-        'button.btn--subtle:has-text("Number")',
-        # Generic fallbacks
-        'a:has-text("Show Number")',
-        'a:has-text("Show number")',
-        '[data-testid*="show"]',
-        '[class*="show-phone"]',
-        '[class*="reveal"]',
-        'button:has-text("See phone")',
-    ]
-
-    for sel in reveal_selectors:
-        try:
-            elements = page.locator(sel)
-            count = await elements.count()
-            for i in range(min(count, 5)):
-                try:
-                    el = elements.nth(i)
-                    if await el.is_visible(timeout=500):
-                        await el.click(timeout=2000)
-                        # Wait for popover to appear
-                        await page.wait_for_timeout(1500)
-                        log.info(f'  Clicked reveal button: {sel}')
-                except Exception:
-                    continue
-        except Exception:
-            continue
-
-    # Also try scrolling to the Contacts section first to ensure buttons are loaded
-    try:
-        contacts_heading = page.locator('text=Contacts').first
-        if await contacts_heading.is_visible(timeout=1000):
-            await contacts_heading.scroll_into_view_if_needed()
-            await page.wait_for_timeout(1000)
-
-            # Re-try clicking phone buttons after scrolling
-            for sel in ['button:has-text("Phone")', 'button:has-text("phone")']:
-                try:
-                    btn = page.locator(sel).first
-                    if await btn.is_visible(timeout=500):
-                        await btn.click(timeout=2000)
-                        await page.wait_for_timeout(1500)
-                        log.info(f'  Clicked after scroll: {sel}')
-                except Exception:
-                    continue
-    except Exception:
-        pass
 
 
 def _is_company_url(url: str) -> bool:
@@ -538,7 +552,6 @@ def _clean_data(data: dict) -> dict:
                 if not value.startswith(('http://', 'https://')):
                     value = f'https://{value}' if '.' in value else ''
             if key == 'description':
-                # Remove generic EuroPages descriptions
                 if 'europages app' in value.lower() or 'supplier search' in value.lower():
                     value = ''
         cleaned[key] = value if value else ''

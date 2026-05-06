@@ -1,0 +1,19 @@
+{
+    "$schema": "https://apify.com/schemas/v1/actor.ide.json",
+    "actorSpecification": 1,
+    "name": "europages-scraper",
+    "title": "EuroPages Company Scraper",
+    "description": "Scrapes company data (name, email, website, phone) from europages.co.uk listings.",
+    "version": "1.0",
+    "buildTag": "latest",
+    "meta": {
+        "templateId": "python-empty",
+        "generatedBy": "Antigravity with Claude Opus 4.6"
+    },
+    "input": "./input_schema.json",
+    "output": "./output_schema.json",
+    "storages": {
+        "dataset": "./dataset_schema.json"
+    },
+    "dockerfile": "../Dockerfile"
+}

@@ -1,0 +1,63 @@
+{
+    "actorSpecification": 1,
+    "fields": {},
+    "views": {
+        "companies": {
+            "title": "Companies",
+            "transformation": {
+                "fields": [
+                    "companyName",
+                    "email",
+                    "website",
+                    "phoneNumber",
+                    "country",
+                    "address",
+                    "description",
+                    "companyType",
+                    "europagesUrl"
+                ]
+            },
+            "display": {
+                "component": "table",
+                "properties": {
+                    "companyName": {
+                        "label": "Company Name",
+                        "format": "text"
+                    },
+                    "email": {
+                        "label": "Email",
+                        "format": "text"
+                    },
+                    "website": {
+                        "label": "Website",
+                        "format": "link"
+                    },
+                    "phoneNumber": {
+                        "label": "Phone",
+                        "format": "text"
+                    },
+                    "country": {
+                        "label": "Country",
+                        "format": "text"
+                    },
+                    "address": {
+                        "label": "Address",
+                        "format": "text"
+                    },
+                    "description": {
+                        "label": "Description",
+                        "format": "text"
+                    },
+                    "companyType": {
+                        "label": "Type",
+                        "format": "text"
+                    },
+                    "europagesUrl": {
+                        "label": "EuroPages URL",
+                        "format": "link"
+                    }
+                }
+            }
+        }
+    }
+}

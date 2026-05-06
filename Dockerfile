@@ -1,25 +1,21 @@
-# Lightweight Python actor - no browser needed
+# Playwright browser + lightweight Python
 FROM apify/actor-python:3.12
 
 USER myuser
 
-# Copy requirements and install
 COPY --chown=myuser:myuser requirements.txt ./
 
-RUN echo "Python version:" \
- && python --version \
- && echo "Pip version:" \
- && pip --version \
- && echo "Installing dependencies:" \
+RUN echo "Installing dependencies:" \
  && pip install -r requirements.txt \
- && echo "All installed Python packages:" \
+ && echo "All packages:" \
  && pip freeze
 
-# Copy source code
+# Install Chromium browser for Playwright
+RUN python -m playwright install chromium --with-deps 2>/dev/null || \
+    python -m playwright install chromium || true
+
 COPY --chown=myuser:myuser . ./
 
-# Compile to verify
 RUN python -m compileall -q my_actor/
 
-# Run the actor
 CMD ["python", "-m", "my_actor"]

@@ -262,8 +262,16 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
                 return [...urls];
             }''')
 
-            log.info(f'  Found {len(links)} company links')
+            log.info(f'  Found {len(links)} raw links')
+            
+            # Filter out non-company URLs
+            skip_patterns = ['terms', 'privacy', 'cookie', 'login', 'signin', 'register', 
+                           'signup', 'contact-us', 'about-us', 'legal', 'faq', 'help',
+                           'conditions', 'imprint', 'impressum', 'datenschutz']
             for link in links:
+                link_lower = link.lower()
+                if any(pat in link_lower for pat in skip_patterns):
+                    continue
                 if not any(c['europagesUrl'] == link for c in companies):
                     companies.append({'europagesUrl': link})
 

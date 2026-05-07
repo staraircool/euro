@@ -103,7 +103,11 @@ async def run_scraper(actor_input: dict) -> list[dict]:
                 url = url_item.get('url', url_item) if isinstance(url_item, dict) else str(url_item)
                 listing_urls.append(url)
         else:
-            listing_urls = [f'{BASE_URL}/companies/{quote_plus(search_query)}.html']
+            # Try multiple URL formats - EuroPages uses different formats
+            listing_urls = [
+                f'{BASE_URL}/search?q={quote_plus(search_query)}&page=1',
+                f'{BASE_URL}/companies/{quote_plus(search_query)}.html',
+            ]
 
         companies = []
         for listing_url in listing_urls:
@@ -112,8 +116,10 @@ async def run_scraper(actor_input: dict) -> list[dict]:
             else:
                 found = await scrape_europages_listings(context, listing_url, max_pages, max_results - len(companies))
                 companies.extend(found)
-                if 0 < max_results <= len(companies):
-                    companies = companies[:max_results]
+                if len(found) > 0 or (0 < max_results <= len(companies)):
+                    # Found results with this URL format, stop trying others
+                    if 0 < max_results <= len(companies):
+                        companies = companies[:max_results]
                     break
 
         log.info(f'═══ Step 1 complete: {len(companies)} companies from EuroPages ═══')
@@ -177,20 +183,36 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
 
             try:
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(2000)
+                # Wait longer for JavaScript to render company listings
+                await page.wait_for_timeout(5000)
             except Exception as e:
                 log.error(f'Failed to load listing: {e}')
                 break
 
             await _dismiss_cookies(page)
+            await page.wait_for_timeout(1000)
+
+            # Log the actual page URL (may have redirected)
+            actual_url = page.url
+            log.info(f'  Actual URL: {actual_url}')
 
             links = await page.evaluate('''() => {
                 const urls = new Set();
                 for (const a of document.querySelectorAll('a[href]')) {
                     const href = a.getAttribute('href');
-                    if (href && /\\/[A-Za-z0-9][^\\/]*\\/SEAC\\d+-\\d+\\.html/.test(href)) {
+                    // Match SEAC company URLs
+                    if (href && /SEAC\d+-\d+\.html/.test(href)) {
                         const full = href.startsWith('http') ? href : window.location.origin + href;
                         urls.add(full);
+                    }
+                }
+                // If no SEAC links found, try broader patterns for company detail pages
+                if (urls.size === 0) {
+                    for (const a of document.querySelectorAll('a[href*="/company/"], a[href*="/supplier/"]')) {
+                        const href = a.href;
+                        if (href && href.includes('europages')) {
+                            urls.add(href);
+                        }
                     }
                 }
                 return [...urls];

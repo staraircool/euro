@@ -190,23 +190,22 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
             log.info(f'Listing page {page_num}: {url}')
 
             try:
-                await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                await page.wait_for_timeout(3000)
+                await page.goto(url, wait_until='domcontentloaded', timeout=20000)
+                await page.wait_for_timeout(2000)
             except Exception as e:
                 log.error(f'Failed to load listing: {e}')
                 break
 
             await _dismiss_cookies(page)
-            await page.wait_for_timeout(1000)
 
             # Log the actual page URL (may have redirected)
             actual_url = page.url
             log.info(f'  Actual URL: {actual_url}')
 
-            # Scroll down to trigger lazy loading (4 scrolls max)
-            for scroll_i in range(4):
+            # Scroll down to trigger lazy loading
+            for scroll_i in range(2):
                 await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                await page.wait_for_timeout(1500)
+                await page.wait_for_timeout(1000)
 
                 # Click "Show more" / "Load more" buttons if present
                 for btn_text in ['Show more', 'show more', 'Load more', 'load more', 'More results', 'Mehr anzeigen', 'Mehr Ergebnisse']:
@@ -267,7 +266,9 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
             # Filter out non-company URLs
             skip_patterns = ['terms', 'privacy', 'cookie', 'login', 'signin', 'register', 
                            'signup', 'contact-us', 'about-us', 'legal', 'faq', 'help',
-                           'conditions', 'imprint', 'impressum', 'datenschutz']
+                           'conditions', 'imprint', 'impressum', 'datenschutz',
+                           'linkedin.com', 'facebook.com', 'twitter.com', 'instagram.com',
+                           'youtube.com', 'tiktok.com', 'pinterest.com', 'x.com']
             for link in links:
                 link_lower = link.lower()
                 if any(pat in link_lower for pat in skip_patterns):

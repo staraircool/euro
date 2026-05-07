@@ -93,7 +93,8 @@ async def run_scraper(actor_input: dict) -> list[dict]:
         context = await browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
-            locale='en-US',
+            locale='en-GB',
+            extra_http_headers={'Accept-Language': 'en-GB,en;q=0.9'},
         )
 
         # ─── STEP 1: Collect company data from EuroPages ───
@@ -105,7 +106,7 @@ async def run_scraper(actor_input: dict) -> list[dict]:
         else:
             # Try multiple URL formats - EuroPages uses different formats
             listing_urls = [
-                f'{BASE_URL}/search?q={quote_plus(search_query)}&page=1',
+                f'{BASE_URL}/search?q={quote_plus(search_query)}',
                 f'{BASE_URL}/companies/{quote_plus(search_query)}.html',
             ]
 
@@ -178,7 +179,14 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
             if 0 < max_items <= len(companies):
                 break
 
-            url = base_url if page_num == 1 else f'{base_url}{"&" if "?" in base_url else "?"}page={page_num}'
+            # Build pagination URL - replace existing page= param or add new one
+            if page_num == 1:
+                url = base_url
+            elif 'page=' in base_url:
+                import re as _re
+                url = _re.sub(r'page=\d+', f'page={page_num}', base_url)
+            else:
+                url = f'{base_url}{"&" if "?" in base_url else "?"}page={page_num}'
             log.info(f'Listing page {page_num}: {url}')
 
             try:

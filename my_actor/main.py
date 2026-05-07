@@ -203,13 +203,13 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
             actual_url = page.url
             log.info(f'  Actual URL: {actual_url}')
 
-            # Scroll down multiple times to trigger lazy loading
-            for scroll_i in range(8):
+            # Scroll down to trigger lazy loading (4 scrolls max)
+            for scroll_i in range(4):
                 await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                 await page.wait_for_timeout(1500)
 
                 # Click "Show more" / "Load more" buttons if present
-                for btn_text in ['Show more', 'show more', 'Load more', 'load more', 'More results', 'Mehr anzeigen']:
+                for btn_text in ['Show more', 'show more', 'Load more', 'load more', 'More results', 'Mehr anzeigen', 'Mehr Ergebnisse']:
                     try:
                         btn = page.locator(f'button:has-text("{btn_text}")').first
                         if await btn.is_visible(timeout=300):
@@ -219,26 +219,46 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
                     except Exception:
                         pass
 
-            # Extract all company links after scrolling
+            # Extract all company links after scrolling - multiple patterns
             links = await page.evaluate('''() => {
                 const urls = new Set();
-                // Match SEAC company URLs
+                const origin = window.location.origin;
+                
                 for (const a of document.querySelectorAll('a[href]')) {
                     const href = a.getAttribute('href');
-                    if (href && /SEAC\d+-\d+\.html/.test(href)) {
-                        const full = href.startsWith('http') ? href : window.location.origin + href;
+                    if (!href) continue;
+                    
+                    const full = href.startsWith('http') ? href : origin + href;
+                    
+                    // Pattern 1: SEAC company URLs (e.g. /COMPANY/SEAC000-001.html)
+                    if (/SEAC\d+-\d+\.html/.test(href)) {
                         urls.add(full);
+                        continue;
+                    }
+                    
+                    // Pattern 2: Company profile links (e.g. /en/company/xxx or /de/unternehmen/xxx)
+                    if (/\/(company|unternehmen|entreprise|empresa|azienda)\//.test(href) && href.includes('europages')) {
+                        urls.add(full);
+                        continue;
+                    }
+                    
+                    // Pattern 3: Supplier links
+                    if (/\/supplier\//.test(href) && href.includes('europages')) {
+                        urls.add(full);
+                        continue;
                     }
                 }
-                // Broader: any europages company detail link
+                
+                // Pattern 4: If still nothing, look for result card links
                 if (urls.size === 0) {
-                    for (const a of document.querySelectorAll('a[href*="/company/"], a[href*="/supplier/"]')) {
-                        const href = a.href;
-                        if (href && href.includes('europages')) {
-                            urls.add(href);
-                        }
+                    // Company result cards often have data attributes or specific classes
+                    const cards = document.querySelectorAll('[data-testid*="company"], [class*="company-card"], [class*="result-item"], [class*="CompanyCard"]');
+                    for (const card of cards) {
+                        const link = card.querySelector('a[href]');
+                        if (link) urls.add(link.href);
                     }
                 }
+                
                 return [...urls];
             }''')
 

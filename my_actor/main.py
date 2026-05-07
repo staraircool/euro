@@ -191,8 +191,7 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
 
             try:
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                # Wait longer for JavaScript to render company listings
-                await page.wait_for_timeout(5000)
+                await page.wait_for_timeout(3000)
             except Exception as e:
                 log.error(f'Failed to load listing: {e}')
                 break
@@ -204,17 +203,34 @@ async def scrape_europages_listings(context, base_url: str, max_pages: int, max_
             actual_url = page.url
             log.info(f'  Actual URL: {actual_url}')
 
+            # Scroll down multiple times to trigger lazy loading
+            for scroll_i in range(8):
+                await page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                await page.wait_for_timeout(1500)
+
+                # Click "Show more" / "Load more" buttons if present
+                for btn_text in ['Show more', 'show more', 'Load more', 'load more', 'More results', 'Mehr anzeigen']:
+                    try:
+                        btn = page.locator(f'button:has-text("{btn_text}")').first
+                        if await btn.is_visible(timeout=300):
+                            await btn.click(timeout=2000)
+                            await page.wait_for_timeout(2000)
+                            log.info(f'    Clicked "{btn_text}" button')
+                    except Exception:
+                        pass
+
+            # Extract all company links after scrolling
             links = await page.evaluate('''() => {
                 const urls = new Set();
+                // Match SEAC company URLs
                 for (const a of document.querySelectorAll('a[href]')) {
                     const href = a.getAttribute('href');
-                    // Match SEAC company URLs
                     if (href && /SEAC\d+-\d+\.html/.test(href)) {
                         const full = href.startsWith('http') ? href : window.location.origin + href;
                         urls.add(full);
                     }
                 }
-                // If no SEAC links found, try broader patterns for company detail pages
+                // Broader: any europages company detail link
                 if (urls.size === 0) {
                     for (const a of document.querySelectorAll('a[href*="/company/"], a[href*="/supplier/"]')) {
                         const href = a.href;
